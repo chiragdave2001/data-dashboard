@@ -1,51 +1,130 @@
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+from typing import Any, Dict, List, Optional
 
+import pandas as pd
+import requests
+import snowflake.connector
 import streamlit as st
-from streamlit.logger import get_logger
 
-LOGGER = get_logger(__name__)
+DATABASE = "CORTEX_ANALYST_DEMO"
+SCHEMA = "REVENUE_TIMESERIES"
+STAGE = "RAW_DATA"
+FILE = "revenue_timeseries.yaml"
+WAREHOUSE = "cortex_analyst_wh"
 
+# replace values below with your Snowflake connection information
+HOST = "ICRMCYS-LM63027.snowflakecomputing.com"
+ACCOUNT = "LM63027"
+USER = "raju"
+PASSWORD = "Raju@123456789"
+ROLE = "ACCOUNTADMIN"
 
-def run():
-    st.set_page_config(
-        page_title="Hello",
-        page_icon="👋",
+if 'CONN' not in st.session_state or st.session_state.CONN is None:
+    st.session_state.CONN = snowflake.connector.connect(
+        user=USER,
+        password=PASSWORD,
+        account=ACCOUNT,
+        host=HOST,
+        port=443,
+        warehouse=WAREHOUSE,
+        role=ROLE,
     )
 
-    st.write("# Welcome to Streamlit! 👋")
+def send_message(prompt: str) -> Dict[str, Any]:
+    """Calls the REST API and returns the response."""
+    request_body = {
+        "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+        "semantic_model_file": f"@{DATABASE}.{SCHEMA}.{STAGE}/{FILE}",
+    }
+    resp = requests.post(
+        url=f"https://{HOST}/api/v2/cortex/analyst/message",
+        json=request_body,
+        headers={
+            "Authorization": f'Snowflake Token="{st.session_state.CONN.rest.token}"',
+            "Content-Type": "application/json",
+        },
+    )
+    request_id = resp.headers.get("X-Snowflake-Request-Id")
+    if resp.status_code < 400:
+        return {**resp.json(), "request_id": request_id}  # type: ignore[arg-type]
+    else:
+        raise Exception(
+            f"Failed request (id: {request_id}) with status {resp.status_code}: {resp.text}"
+        )
 
-    st.sidebar.success("Select a demo above.")
-
-    st.markdown(
-        """
-        Streamlit is an open-source app framework built specifically for
-        Machine Learning and Data Science projects.
-        **👈 Select a demo from the sidebar** to see some examples
-        of what Streamlit can do!
-        ### Want to learn more?
-        - Check out [streamlit.io](https://streamlit.io)
-        - Jump into our [documentation](https://docs.streamlit.io)
-        - Ask a question in our [community
-          forums](https://discuss.streamlit.io)
-        ### See more complex demos
-        - Use a neural net to [analyze the Udacity Self-driving Car Image
-          Dataset](https://github.com/streamlit/demo-self-driving)
-        - Explore a [New York City rideshare dataset](https://github.com/streamlit/demo-uber-nyc-pickups)
-    """
+def process_message(prompt: str) -> None:
+    """Processes a message and adds the response to the chat."""
+    st.session_state.messages.append(
+        {"role": "user", "content": [{"type": "text", "text": prompt}]}
+    )
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    with st.chat_message("assistant"):
+        with st.spinner("Generating response..."):
+            response = send_message(prompt=prompt)
+            request_id = response["request_id"]
+            content = response["message"]["content"]
+            display_content(content=content, request_id=request_id)  # type: ignore[arg-type]
+    st.session_state.messages.append(
+        {"role": "assistant", "content": content, "request_id": request_id}
     )
 
+def display_content(
+    content: List[Dict[str, str]],
+    request_id: Optional[str] = None,
+    message_index: Optional[int] = None,
+) -> None:
+    """Displays a content item for a message."""
+    message_index = message_index or len(st.session_state.messages)
+    if request_id:
+        with st.expander("Request ID", expanded=False):
+            st.markdown(request_id)
+    for item in content:
+        if item["type"] == "text":
+            st.markdown(item["text"])
+        elif item["type"] == "suggestions":
+            with st.expander("Suggestions", expanded=True):
+                for suggestion_index, suggestion in enumerate(item["suggestions"]):
+                    if st.button(suggestion, key=f"{message_index}_{suggestion_index}"):
+                        st.session_state.active_suggestion = suggestion
+        elif item["type"] == "sql":
+            with st.expander("SQL Query", expanded=False):
+                st.code(item["statement"], language="sql")
+            with st.expander("Results", expanded=True):
+                with st.spinner("Running SQL..."):
+                    df = pd.read_sql(item["statement"], st.session_state.CONN)
+                    if len(df.index) > 1:
+                        data_tab, line_tab, bar_tab = st.tabs(
+                            ["Data", "Line Chart", "Bar Chart"]
+                        )
+                        data_tab.dataframe(df)
+                        if len(df.columns) > 1:
+                            df = df.set_index(df.columns[0])
+                        with line_tab:
+                            st.line_chart(df)
+                        with bar_tab:
+                            st.bar_chart(df)
+                    else:
+                        st.dataframe(df)
 
-if __name__ == "__main__":
-    run()
+st.title("Cortex Analyst")
+st.markdown(f"Semantic Model: `{FILE}`")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+    st.session_state.suggestions = []
+    st.session_state.active_suggestion = None
+
+for message_index, message in enumerate(st.session_state.messages):
+    with st.chat_message(message["role"]):
+        display_content(
+            content=message["content"],
+            request_id=message.get("request_id"),
+            message_index=message_index,
+        )
+
+if user_input := st.chat_input("What is your question?"):
+    process_message(prompt=user_input)
+
+if st.session_state.active_suggestion:
+    process_message(prompt=st.session_state.active_suggestion)
+    st.session_state.active_suggestion = None
